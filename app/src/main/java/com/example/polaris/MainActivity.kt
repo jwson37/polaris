@@ -1,30 +1,45 @@
 package com.example.polaris
 
+import android.Manifest
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.DashPathEffect
+import android.graphics.drawable.GradientDrawable
 import android.graphics.Paint
 import android.graphics.Typeface
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
 import android.util.TypedValue
 import android.view.GestureDetector
+import android.view.KeyEvent
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
+import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
@@ -662,6 +677,12 @@ class FitTextView(
     }
 }
 
+/** One recorded observation. */
+class Mark(
+    val n: Int, val utcMs: Long, val target: String, val lat: Double, val lon: Double,
+    val appAlt: Double, val geoAlt: Double, val az: Double, val ra: Double, val dec: Double
+)
+
 class MainActivity : AppCompatActivity() {
 
     private val handler = Handler(Looper.getMainLooper())
@@ -679,6 +700,19 @@ class MainActivity : AppCompatActivity() {
     private lateinit var prefs: SharedPreferences
     private lateinit var detector: GestureDetector
     private var starIndex = 0
+
+    // ---- marks (recorded values) and voice control
+    private val marks = ArrayList<Mark>()
+    private lateinit var statusLabel: TextView
+    private lateinit var logBtn: Button
+    private lateinit var micBtn: Button
+    private var recognizer: SpeechRecognizer? = null
+    private var voiceOn = false
+    private var lastMarkAt = 0L
+    private val isoFmt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US)
+        .apply { timeZone = TimeZone.getTimeZone("UTC") }
+    private val tone by lazy { ToneGenerator(AudioManager.STREAM_NOTIFICATION, 90) }
+    private val restoreStatus = Runnable { statusLabel.text = idleStatus() }
     private lateinit var timeLabel: TextView
     private lateinit var timeView: TextView
 
@@ -787,6 +821,19 @@ class MainActivity : AppCompatActivity() {
                     .hideSoftInputFromWindow(root.windowToken, 0)
             }
         }
+        statusLabel = label("").apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            )
+        }
+        val markBtn = redButton("MARK").apply { setOnClickListener { markNow("button") } }
+        logBtn = redButton("LOG (0)").apply { setOnClickListener { showLog() } }
+        micBtn = redButton("MIC OFF").apply { setOnClickListener { toggleVoice() } }
+        val buttonRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(markBtn); addView(logBtn); addView(micBtn)
+        }
         root.addView(titleView); root.addView(starInfo); root.addView(coordLabel); root.addView(row)
         root.addView(altLabel); root.addView(altView)
         timeLabel = label("TIME (UTC)")
@@ -797,6 +844,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(azLabel); root.addView(azView)
         root.addView(sky)
         root.addView(timeLabel); root.addView(timeView)
+        root.addView(statusLabel); root.addView(buttonRow)
         root.addView(info)
         setContentView(root)
         if (edgeToEdge) ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
@@ -812,6 +860,9 @@ class MainActivity : AppCompatActivity() {
         }
 
         prefs = getSharedPreferences("polaris", MODE_PRIVATE)
+        loadMarks()
+        refreshButtons()
+        statusLabel.text = idleStatus()
         latIn.setText(prefs.getString("lat", ""))
         lonIn.setText(prefs.getString("lon", ""))
         val hasCoords = latIn.text.toString().toDoubleOrNull() != null &&
@@ -849,6 +900,250 @@ class MainActivity : AppCompatActivity() {
         selectStar(prefs.getInt("star", 0))
     }
 
+    // =====================  MARK: record the current values  =====================
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun redButton(label: String) = Button(this).apply {
+        text = label
+        isAllCaps = false
+        setTextColor(red)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+        typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+        setPadding(0, 0, 0, 0)
+        background = GradientDrawable().apply {
+            setColor(Color.BLACK)
+            setStroke(dp(2), red)
+            cornerRadius = dp(8).toFloat()
+        }
+        layoutParams = LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(3), dp(2), dp(3), dp(2)) }
+    }
+
+    private fun utcString(ms: Long) = isoFmt.format(Date(ms)) + String.format(Locale.US, ".%02dZ", (ms % 1000) / 10)
+
+    private fun idleStatus() =
+        if (voiceOn) "mic on: say \"mark\"   (also MARK or volume-down)"
+        else "mic off   (MARK button or volume-down also marks)"
+
+    private fun setStatus(text: String) {
+        statusLabel.text = text
+        handler.removeCallbacks(restoreStatus)
+        handler.postDelayed(restoreStatus, 3500)
+    }
+
+    private fun refreshButtons() {
+        logBtn.text = "LOG (${marks.size})"
+        micBtn.text = if (voiceOn) "MIC ON" else "MIC OFF"
+    }
+
+    /** Record exactly what the screen is showing right now. */
+    private fun markNow(source: String) {
+        val lat = latIn.text.toString().toDoubleOrNull()
+        val lon = lonIn.text.toString().toDoubleOrNull()
+        if (lat == null || lon == null || abs(lat) > 90 || abs(lon) > 180) {
+            setStatus("cannot mark: enter latitude and longitude first")
+            return
+        }
+        val now = System.currentTimeMillis()
+        val target = TARGETS[starIndex]
+        val r = Astro.compute(target, lat, lon, now)
+        val mk = Mark(marks.size + 1, now, target.name, lat, lon, r.appAlt, r.geoAlt, r.az, r.ra, r.dec)
+        marks.add(mk)
+        saveMarks()
+        refreshButtons()
+        beepAndBuzz()
+        setStatus(String.format(Locale.US, "MARKED #%d  %s  %s  (%s)", mk.n, target.name,
+            bigClock.format(Date(now)) + String.format(Locale.US, ".%02d", (now % 1000) / 10), source))
+    }
+
+    @Suppress("DEPRECATION")
+    private fun beepAndBuzz() {
+        try { tone.startTone(ToneGenerator.TONE_PROP_BEEP, 120) } catch (e: RuntimeException) { }
+        val v = getSystemService(VIBRATOR_SERVICE) as? Vibrator ?: return
+        if (Build.VERSION.SDK_INT >= 26) v.vibrate(VibrationEffect.createOneShot(80, VibrationEffect.DEFAULT_AMPLITUDE))
+        else v.vibrate(80)
+    }
+
+    private fun csvLine(m: Mark) = String.format(
+        Locale.US, "%d,%s,%d,%s,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f",
+        m.n, utcString(m.utcMs), m.utcMs, m.target, m.lat, m.lon, m.appAlt, m.geoAlt, m.az, m.ra, m.dec
+    )
+
+    private fun saveMarks() {
+        prefs.edit().putString("marks", marks.joinToString("\n") { csvLine(it) }).apply()
+    }
+
+    private fun loadMarks() {
+        marks.clear()
+        for (line in (prefs.getString("marks", "") ?: "").lines()) {
+            if (line.isBlank()) continue
+            try {
+                val f = line.split(",")
+                marks.add(Mark(f[0].toInt(), f[2].toLong(), f[3], f[4].toDouble(), f[5].toDouble(),
+                    f[6].toDouble(), f[7].toDouble(), f[8].toDouble(), f[9].toDouble(), f[10].toDouble()))
+            } catch (e: Exception) { }
+        }
+    }
+
+    private fun showLog() {
+        val text = if (marks.isEmpty()) "No marks yet.\n\nSay \"mark\", tap MARK, or press volume-down."
+        else marks.reversed().joinToString("\n\n") { m ->
+            "#${m.n}  ${isoFmt.format(Date(m.utcMs))}" + String.format(Locale.US, ".%02d UTC", (m.utcMs % 1000) / 10) +
+                    "\n${m.target.uppercase()}\nalt ${Astro.dmsFixed(if (m.appAlt < 0) '-' else ' ', m.appAlt)}" +
+                    "\naz  ${Astro.dmsFixed(' ', m.az)}"
+        }
+        val tv = TextView(this).apply {
+            typeface = Typeface.MONOSPACE
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+            this.text = text
+            setTextIsSelectable(true)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Marks (${marks.size})")
+            .setView(ScrollView(this).apply { addView(tv) })
+            .setPositiveButton("Share") { _, _ -> shareMarks() }
+            .setNeutralButton("Clear") { _, _ -> confirmClear() }
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
+    private fun shareMarks() {
+        if (marks.isEmpty()) return
+        val csv = "n,utc,epoch_ms,target,lat,lon,alt_apparent_deg,alt_geometric_deg,az_deg,ra_deg,dec_deg\n" +
+                marks.joinToString("\n") { csvLine(it) }
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, "Star marks")
+            putExtra(Intent.EXTRA_TEXT, csv)
+        }
+        startActivity(Intent.createChooser(send, "Share marks"))
+    }
+
+    private fun confirmClear() {
+        AlertDialog.Builder(this)
+            .setTitle("Delete all ${marks.size} marks?")
+            .setPositiveButton("Delete") { _, _ ->
+                marks.clear(); saveMarks(); refreshButtons()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    // Volume-down also marks: instant, no speech delay.
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
+            if (event.repeatCount == 0) markNow("volume key")
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    // =====================  Voice: say "mark"  =====================
+
+    private val restartListening = Runnable { if (voiceOn) listen() }
+
+    private fun toggleVoice() {
+        if (voiceOn) {
+            voiceOn = false
+            handler.removeCallbacks(restartListening)
+            recognizer?.cancel()
+            refreshButtons()
+            statusLabel.text = idleStatus()
+            return
+        }
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            setStatus("speech recognition is not available on this phone")
+            return
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 77)
+            return
+        }
+        voiceOn = true
+        refreshButtons()
+        statusLabel.text = idleStatus()
+        listen()
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 77) {
+            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) toggleVoice()
+            else setStatus("microphone permission denied")
+        }
+    }
+
+    private fun heardMark(b: Bundle?): Boolean {
+        val list = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: return false
+        return list.any { phrase -> phrase.lowercase(Locale.US).split(Regex("[^a-z]+")).contains("mark") }
+    }
+
+    private fun voiceMark() {
+        val now = System.currentTimeMillis()
+        if (now - lastMarkAt < 1500) return          // ignore repeats of the same word
+        lastMarkAt = now
+        markNow("voice")
+        recognizer?.cancel()                          // start a fresh phrase for the next "mark"
+        handler.removeCallbacks(restartListening)
+        handler.postDelayed(restartListening, 250)
+    }
+
+    private val listener = object : RecognitionListener {
+        override fun onReadyForSpeech(params: Bundle?) {}
+        override fun onBeginningOfSpeech() {}
+        override fun onRmsChanged(rmsdB: Float) {}
+        override fun onBufferReceived(buffer: ByteArray?) {}
+        override fun onEndOfSpeech() {}
+        override fun onEvent(eventType: Int, params: Bundle?) {}
+
+        override fun onPartialResults(partialResults: Bundle?) {
+            if (voiceOn && heardMark(partialResults)) voiceMark()
+        }
+
+        override fun onResults(results: Bundle?) {
+            if (!voiceOn) return
+            if (heardMark(results)) voiceMark()
+            else {
+                handler.removeCallbacks(restartListening)
+                handler.postDelayed(restartListening, 100)
+            }
+        }
+
+        override fun onError(error: Int) {
+            if (!voiceOn) return
+            if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+                voiceOn = false
+                refreshButtons()
+                setStatus("microphone permission missing")
+                return
+            }
+            val delay = when (error) {
+                SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> 800L
+                SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT,
+                SpeechRecognizer.ERROR_SERVER -> 1500L
+                else -> 300L
+            }
+            handler.removeCallbacks(restartListening)
+            handler.postDelayed(restartListening, delay)
+        }
+    }
+
+    private fun listen() {
+        if (!voiceOn) return
+        if (recognizer == null) {
+            recognizer = SpeechRecognizer.createSpeechRecognizer(this).apply { setRecognitionListener(listener) }
+        }
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+        }
+        recognizer?.startListening(intent)
+    }
+
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
         detector.onTouchEvent(ev)
         return super.dispatchTouchEvent(ev)
@@ -867,11 +1162,20 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         handler.post(ticker)
+        if (voiceOn) listen()
     }
 
     override fun onPause() {
         super.onPause()
         handler.removeCallbacks(ticker)
+        handler.removeCallbacks(restartListening)
+        recognizer?.cancel()
+    }
+
+    override fun onDestroy() {
+        recognizer?.destroy()
+        recognizer = null
+        super.onDestroy()
     }
 
     private fun update() {
